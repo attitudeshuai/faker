@@ -59,6 +59,13 @@ class Documentor:
             if name.startswith("_") or name in self.already_generated:
                 continue
 
+            # Only document the method under the provider that currently owns
+            # it. Same-name methods provided by a higher-precedence provider
+            # are reported under that provider's section instead; actively
+            # shadowed methods are attributed to no provider.
+            if self.generator.get_provider_of(name) is not provider:
+                continue
+
             arguments = []
             faker_args: List[Union[str, Type[Enum]]] = []
             faker_kwargs = {}

@@ -9,7 +9,23 @@ import pytest
 
 from faker import Faker
 from faker.config import DEFAULT_LOCALE
+from faker.documentor import Documentor
 from faker.generator import Generator
+from faker.providers import BaseProvider, DynamicProvider
+
+
+class DocFooProvider(BaseProvider):
+    __provider__ = "doc_foo_provider"
+
+    def doc_collision_method(self):
+        return "foo"
+
+
+class DocBarProvider(BaseProvider):
+    __provider__ = "doc_bar_provider"
+
+    def doc_collision_method(self):
+        return "bar"
 
 
 class TestFakerProxyClass:
@@ -429,6 +445,7 @@ class TestFakerProxyClass:
                 "_weights",
                 "_unique_proxy",
                 "_optional_proxy",
+                "_cache_versions",
             ]
         )
         for factory in fake.factories:
@@ -517,3 +534,136 @@ class TestFakerProxyClass:
         fake = Faker()
         pickled = pickle.dumps(fake)
         pickle.loads(pickled)
+
+    # ------------------------------------------------------------------
+    # Method dispatch resolution
+    # ------------------------------------------------------------------
+
+    def test_single_locale_shadow_and_restore_via_faker(self):
+        fake = Faker()
+        original = fake.get_provider_of("name")
+
+        fake.shadow_method("name", lambda: "X")
+        assert fake.name() == "X"
+        assert fake.get_provider_of("name") is None
+        assert fake.is_shadowed("name")
+
+        fake.restore_method("name")
+        assert fake.get_provider_of("name") is original
+        assert fake.name() != "X"
+
+    def test_multiple_locale_cache_invalidated_by_shadow(self):
+        fake = Faker(["en_US", "en_PH"])
+        fake.name()  # populate the candidate mapping cache
+        assert fake._cache_versions["name"] == fake._factory_versions()
+
+        fake["en_US"].shadow_method("name", lambda: "SHADOW")
+        assert fake._cache_versions["name"] != fake._factory_versions()
+
+        old_mapping = getattr(fake, "_cached_name_mapping")
+        new_mapping = fake._map_provider_method("name")
+        assert new_mapping is not old_mapping
+        assert fake._cache_versions["name"] == fake._factory_versions()
+
+    def test_multiple_locale_shadowed_function_is_dispatched(self):
+        fake = Faker(["en_US", "en_PH"])
+        en_us = fake["en_US"]
+        en_us.shadow_method("name", lambda: "SHADOW")
+
+        # Force the en_US factory to be selected
+        with patch.object(fake.factories[0].random, "choice", return_value=en_us):
+            assert fake.name() == "SHADOW"
+
+    def test_multiple_locale_shadow_and_restore(self):
+        fake = Faker(["en_US", "ja_JP"])
+        fake.shadow_method("name", lambda: "SHADOW")
+
+        assert fake.is_shadowed("name")
+        assert fake["en_US"].is_shadowed("name")
+        assert fake["ja_JP"].is_shadowed("name")
+
+        fake.restore_method("name")
+        assert not fake.is_shadowed("name")
+        assert not fake["en_US"].is_shadowed("name")
+
+    def test_multiple_locale_shadow_unknown_method_raises(self):
+        fake = Faker(["en_US", "ja_JP"])
+        with pytest.raises(AttributeError):
+            fake.shadow_method("totally_unknown_xyz", lambda: None)
+
+    def test_multiple_locale_add_provider_to_every_locale(self):
+        fake = Faker(["en_US", "ja_JP"])
+        provider = DynamicProvider(
+            provider_name="my_dynamic_xyz",
+            elements=["A", "B"],
+        )
+        fake.add_provider(provider)
+
+        assert fake.get_provider_name_of("my_dynamic_xyz") == {
+            "en_US": "my_dynamic_xyz",
+            "ja_JP": "my_dynamic_xyz",
+        }
+        assert fake.my_dynamic_xyz() in ("A", "B")
+
+    def test_multiple_locale_get_provider_of_returns_locale_mapping(self):
+        fake = Faker(["en_US", "en_PH"])
+        owners = fake.get_provider_of("luzon_province")
+
+        assert owners["en_PH"] is fake["en_PH"].get_provider_of("luzon_province")
+        assert owners["en_US"] is None
+
+    def test_multiple_locale_reporting_and_dispatch_consistent(self):
+        fake = Faker(["en_US", "en_PH"])
+        owners = fake.get_method_owners()
+        for locale, method_owners in owners.items():
+            factory = fake[locale]
+            for name, owner in method_owners.items():
+                function = getattr(factory, name)
+                assert callable(function)
+                if owner is not None:
+                    assert function.__self__ is owner
+                else:
+                    assert factory.is_shadowed(name)
+
+    def test_multiple_locale_conflicts_aggregated(self):
+        fake = Faker(["en_US", "ja_JP"])
+        assert isinstance(fake.get_conflicts(), dict)
+
+    # ------------------------------------------------------------------
+    # Documentor attribution
+    # ------------------------------------------------------------------
+
+    def test_documentor_reports_conflict_under_actual_owner(self):
+        fake = Faker()
+        fake.add_provider(DocFooProvider)
+        fake.add_provider(DocBarProvider)
+
+        doc = Documentor(fake)
+        formatters = doc.get_formatters(with_args=True, with_defaults=True)
+        sections = [(provider.__provider__, list(fm.keys())) for provider, fm in formatters]
+
+        hits = [
+            name
+            for name, signatures in sections
+            if any("doc_collision_method" in signature for signature in signatures)
+        ]
+        assert hits == ["doc_bar_provider"]
+
+    def test_documentor_hides_shadowed_method_from_provider_sections(self):
+        fake = Faker()
+        fake.add_provider(DocFooProvider)
+        fake.add_provider(DocBarProvider)
+        doc = Documentor(fake)
+
+        fake.shadow_method("doc_collision_method", lambda: "z")
+        shadowed = doc.get_formatters()
+        assert not any("doc_collision_method" in signature for _, fm in shadowed for signature in fm)
+
+        fake.restore_method("doc_collision_method")
+        restored = doc.get_formatters()
+        hits = [
+            provider.__provider__
+            for provider, fm in restored
+            if any("doc_collision_method" in signature for signature in fm)
+        ]
+        assert hits == ["doc_bar_provider"]

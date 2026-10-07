@@ -24,6 +24,9 @@ class BaseProvider:
     __provider__ = "base"
     __lang__: Optional[str] = None
     __use_weighting__ = False
+    # Declared priority used to resolve same-name method collisions.
+    # Higher priority wins; ties fall back to registration order.
+    __priority__ = 0
 
     # Locales supported by Linux Mint from `/usr/share/i18n/SUPPORTED`
     language_locale_codes = {
@@ -720,6 +723,8 @@ class DynamicProvider(BaseProvider):
             raise ValueError("Provider name cannot start with __ as it would be ignored by Faker")
 
         self.provider_name = provider_name
+        # Ensure the provider is discoverable by its declared provider name
+        self.__provider__ = provider_name
 
         self.elements = []
         if elements:

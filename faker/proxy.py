@@ -12,6 +12,7 @@ from .config import DEFAULT_LOCALE
 from .exceptions import UniquenessException
 from .factory import Factory
 from .generator import Generator
+from .providers import DynamicProvider
 from .typing import SeedType
 from .utils.distribution import choices_distribution
 
@@ -24,8 +25,31 @@ class Faker:
     """Proxy class capable of supporting multiple locales"""
 
     cache_pattern: Pattern = re.compile(r"^_cached_\w*_mapping$")
+    # Generator methods transparently proxied in single-locale mode. Methods
+    # explicitly implemented on this proxy class are excluded, since they no
+    # longer go through ``__getattr__``.
     generator_attrs = [
-        attr for attr in dir(Generator) if not attr.startswith("__") and attr not in ["seed", "seed_instance", "random"]
+        attr
+        for attr in dir(Generator)
+        if not attr.startswith("__")
+        and attr
+        not in [
+            "seed",
+            "seed_instance",
+            "random",
+            "add_provider",
+            "shadow_method",
+            "restore_method",
+            "unshadow_method",
+            "get_provider_of",
+            "method_provider",
+            "get_provider_name_of",
+            "get_method_info",
+            "get_method_owners",
+            "get_conflicts",
+            "get_conflict_log",
+            "is_shadowed",
+        ]
     ]
 
     def __init__(
@@ -41,6 +65,8 @@ class Faker:
         self._weights = None
         self._unique_proxy = UniqueProxy(self)
         self._optional_proxy = OptionalProxy(self)
+        # Per-method cache validity key: tuple of per-factory dispatch versions.
+        self._cache_versions: dict[str, tuple] = {}
 
         if isinstance(locale, str):
             locales = [locale.replace("-", "_")]
@@ -146,6 +172,7 @@ class Faker:
         result._factory_map = copy.deepcopy(self._factory_map, memodict)
         result._factories = list(result._factory_map.values())
         result._weights = copy.deepcopy(self._weights, memodict)
+        result._cache_versions = copy.deepcopy(self._cache_versions, memodict)
         result._unique_proxy = UniqueProxy(result)
         result._unique_proxy._seen = {k: {result._unique_proxy._sentinel} for k in self._unique_proxy._seen.keys()}
         result._optional_proxy = OptionalProxy(result)
@@ -190,6 +217,14 @@ class Faker:
     def _select_factory_choice(self, factories):
         return self._factories[0].random.choice(factories)
 
+    def _factory_versions(self) -> tuple:
+        """Returns the current dispatch version of each factory.
+
+        A change in providers or shadow state bumps the affected factory's
+        version, which invalidates any cached candidate mapping.
+        """
+        return tuple(getattr(factory, "_dispatch_version", 0) for factory in self._factories)
+
     def _map_provider_method(self, method_name: str) -> tuple[list[Factory], list[float] | None]:
         """
         Creates a 2-tuple of factories and weights for the given provider method name
@@ -197,16 +232,21 @@ class Faker:
         The first element of the tuple contains a list of compatible factories.
         The second element of the tuple contains a list of distribution weights.
 
+        The result is cached per method name, but the cache is recomputed
+        whenever any factory's provider/shadow state changes.
+
         :param method_name: Name of provider method
         :return: 2-tuple (factories, weights)
         """
 
-        # Return cached mapping if it exists for given method
         attr = f"_cached_{method_name}_mapping"
-        if hasattr(self, attr):
+        versions = self._factory_versions()
+
+        # Return cached mapping only while every factory's state is unchanged
+        if hasattr(self, attr) and self._cache_versions.get(method_name) == versions:
             return getattr(self, attr)
 
-        # Create mapping if it does not exist
+        # Create (or recreate) mapping
         if self._weights:
             value = [
                 (factory, weight)
@@ -221,6 +261,7 @@ class Faker:
 
         # Then cache and return results
         setattr(self, attr, mapping)
+        self._cache_versions[method_name] = versions
         return mapping
 
     @classmethod
@@ -296,6 +337,148 @@ class Faker:
 
     def items(self) -> list[tuple[str, Generator | Faker]]:
         return list(self._factory_map.items())
+
+    # ------------------------------------------------------------------
+    # Provider registration and method shadowing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clone_provider_for(provider: Any, factory: Generator) -> Any:
+        """Creates a factory-bound copy of a provider for a single locale."""
+        if isinstance(provider, type):
+            return provider(factory)
+        if isinstance(provider, DynamicProvider):
+            return DynamicProvider(
+                provider_name=provider.provider_name,
+                elements=provider.elements,
+                generator=factory,
+            )
+        # Standard providers are constructed with the generator as the only
+        # required argument.
+        return type(provider)(factory)
+
+    def add_provider(self, provider: Any) -> None:
+        """Adds a provider to the faker instance.
+
+        In single-locale mode this is proxied to the underlying generator.
+        In multiple-locale mode a separate, factory-bound copy of the
+        provider is added to every locale.
+        """
+        if len(self._factories) == 1:
+            self._factories[0].add_provider(provider)
+            return
+
+        # Build every copy before mutating any factory, so a construction
+        # failure never leaves a partially registered provider.
+        provider_copies = [(factory, self._clone_provider_for(provider, factory)) for factory in self._factories]
+        for factory, provider_copy in provider_copies:
+            factory.add_provider(provider_copy)
+
+    def shadow_method(self, method_name: str, function: Callable) -> None:
+        """Shadows a method on the instance.
+
+        In multiple-locale mode the shadow is installed on every locale that
+        currently provides the method.
+        """
+        if len(self._factories) == 1:
+            self._factories[0].shadow_method(method_name, function)
+            return
+
+        targets = [factory for factory in self._factories if hasattr(factory, method_name)]
+        if not targets:
+            msg = f"No generator object has attribute {method_name!r}"
+            raise AttributeError(msg)
+        for factory in targets:
+            factory.shadow_method(method_name, function)
+
+    def restore_method(self, method_name: str) -> None:
+        """Restores a shadowed method on the instance."""
+        if len(self._factories) == 1:
+            self._factories[0].restore_method(method_name)
+            return
+
+        targets = [factory for factory in self._factories if factory.is_shadowed(method_name)]
+        if not targets:
+            raise ValueError(f"Method {method_name!r} is not shadowed")
+        for factory in targets:
+            factory.restore_method(method_name)
+
+    def unshadow_method(self, method_name: str) -> None:
+        """Alias of :meth:`restore_method`."""
+        self.restore_method(method_name)
+
+    def is_shadowed(self, method_name: str) -> bool:
+        """Returns whether a shadow is active for the method on the instance."""
+        if len(self._factories) == 1:
+            return self._factories[0].is_shadowed(method_name)
+        return any(factory.is_shadowed(method_name) for factory in self._factories)
+
+    # ------------------------------------------------------------------
+    # Dispatch reporting
+    # ------------------------------------------------------------------
+
+    def get_provider_of(self, method_name: str) -> Any:
+        """Returns the provider of the method.
+
+        Single-locale mode returns the provider instance (or ``None``).
+        Multiple-locale mode returns a mapping of locale to provider.
+        """
+        if len(self._factories) == 1:
+            return self._factories[0].get_provider_of(method_name)
+        return {locale: factory.get_provider_of(method_name) for locale, factory in self._factory_map.items()}
+
+    def get_provider_name_of(self, method_name: str) -> Any:
+        """Returns the provider name of the method.
+
+        Multiple-locale mode returns a mapping of locale to provider name.
+        """
+        if len(self._factories) == 1:
+            return self._factories[0].get_provider_name_of(method_name)
+        return {locale: factory.get_provider_name_of(method_name) for locale, factory in self._factory_map.items()}
+
+    def get_method_info(self, method_name: str) -> Any:
+        """Returns a full resolution report for the method.
+
+        Multiple-locale mode returns a mapping of locale to resolution report.
+        """
+        if len(self._factories) == 1:
+            return self._factories[0].get_method_info(method_name)
+        return {locale: factory.get_method_info(method_name) for locale, factory in self._factory_map.items()}
+
+    def get_method_owners(self) -> Any:
+        """Returns method ownership for the instance.
+
+        Multiple-locale mode returns a mapping of locale to method-owner map.
+        """
+        if len(self._factories) == 1:
+            return self._factories[0].get_method_owners()
+        return {locale: factory.get_method_owners() for locale, factory in self._factory_map.items()}
+
+    def get_conflicts(self) -> Any:
+        """Returns conflict records for the instance.
+
+        Single-locale mode returns a method-keyed mapping. Multiple-locale mode
+        returns a mapping of method name to a list of ``(locale, record)``.
+        """
+        if len(self._factories) == 1:
+            return self._factories[0].get_conflicts()
+
+        result: dict = {}
+        for locale, factory in self._factory_map.items():
+            for name, record in factory.get_conflicts().items():
+                result.setdefault(name, []).append((locale, record))
+        return result
+
+    def get_conflict_log(self) -> Any:
+        """Returns the conflict resolution log for the instance."""
+        if len(self._factories) == 1:
+            return self._factories[0].get_conflict_log()
+
+        result = []
+        for locale, factory in self._factory_map.items():
+            for record in factory.get_conflict_log():
+                result.append((locale, record))
+        return result
 
 
 class UniqueProxy:

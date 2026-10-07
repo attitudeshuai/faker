@@ -902,9 +902,20 @@ class Provider(BaseProvider):
         # Check if an argument group has been supplied
         if re.match(r"^[a-zA-Z0-9_-]*:\w", definition):
             definition, argument_group = definition.split(":")
-            arguments = self.generator.get_arguments(argument_group.strip())
-
-            return self.generator.format(definition.strip(), **arguments)
+            group = argument_group.strip()
+            return self.generator.format_token(
+                definition.strip(),
+                group,
+                token=definition,
+                position=0,
+                template=definition,
+            )
 
         # Assume the string is referring to a provider
-        return self.generator.format(definition, **kwargs)
+        return self.generator.format_token(
+            definition,
+            token=definition,
+            position=0,
+            template=definition,
+            **kwargs,
+        )

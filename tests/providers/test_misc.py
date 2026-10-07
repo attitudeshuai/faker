@@ -575,6 +575,35 @@ class TestMiscProvider:
         assert json_data.get("item1") == "FooBarBaz"
         assert json_data.get("item2") == "FooBarBAZ"
 
+    def test_json_with_unknown_argument_group(self, faker_with_foobar):
+        kwargs = {
+            "data_columns": {"item": "foo_bar:missing_group"},
+            "num_rows": 1,
+        }
+        with pytest.raises(exceptions.UnknownArgumentGroup) as excinfo:
+            faker_with_foobar.json(**kwargs)
+        assert excinfo.value.group == "missing_group"
+
+    def test_json_with_unknown_formatter(self, faker_with_foobar):
+        kwargs = {
+            "data_columns": {"item": "missing_formatter"},
+            "num_rows": 1,
+        }
+        with pytest.raises(exceptions.UnknownTemplate) as excinfo:
+            faker_with_foobar.json(**kwargs)
+        assert excinfo.value.formatter == "missing_formatter"
+
+    def test_dsv_with_unknown_formatter_token(self, faker):
+        with pytest.raises(exceptions.UnknownTemplate):
+            faker.dsv(data_columns=("{{missing_formatter}}",), num_rows=1)
+
+    def test_fixed_width_with_unknown_argument_group(self, faker_with_foobar):
+        with pytest.raises(exceptions.UnknownArgumentGroup):
+            faker_with_foobar.fixed_width(
+                data_columns=[(20, "foo_bar:missing_group")],
+                num_rows=1,
+            )
+
     def test_json_multiple_rows(self, faker_with_foobar):
         kwargs = {
             "data_columns": {"item": "foo_bar"},

@@ -409,3 +409,76 @@ fast membership testing.
    fake = faker.Faker()
 
    fake.unique.profile()  # TypeError: unhashable type: 'dict'
+
+
+Generator-State Snapshots
+-------------------------
+
+The state that determines what a ``Faker`` instance generates next is spread
+across the proxy, its locale generators, and the ``.unique`` proxy. It can be
+exported explicitly with :meth:`Faker.snapshot() <faker.proxy.Faker.snapshot>`
+and reapplied with :meth:`Faker.restore() <faker.proxy.Faker.restore>`.
+
+A snapshot is a plain, JSON-compatible dictionary with an explicit version
+marker (``snapshot_version``). It covers:
+
+* the position (full internal state) of every random source, including
+  whether a generator is bound to the shared random object,
+* the ``.unique`` value history (the private sentinel is never exported),
+* the argument groups on every generator,
+* the locale weights and the provider-method selection cache,
+* descriptions of the providers registered at runtime, identified by the
+  importable module and qualified class name of each class.
+
+After a restore, the instance continues the same random sequence from the
+recorded position.
+
+.. code:: python
+
+   import json
+   from faker import Faker
+
+   fake = Faker(['de_DE', 'en_US', 'ja_JP'])
+   fake.seed_instance(0)
+   fake.name()
+
+   state = fake.snapshot()
+
+   # A snapshot contains only primitive data, so it can be written to a file
+   # and restored in another process.
+   with open('state.json', 'w') as f:
+       json.dump(state, f)
+
+   with open('state.json') as f:
+       restored = Faker.from_snapshot(json.load(f))
+
+Runtime providers are portable only if their class can be imported in the
+target process. Classes defined in ``__main__`` (scripts, notebooks) or inside
+functions or other local scopes cannot be represented. In that case the export
+or import raises an ``UnrepresentableProviderError`` that identifies the
+provider class, the locale generator it belongs to, its position in the
+provider chain, and the methods it provides. The whole snapshot is decoded and
+validated -- and every runtime provider object constructed -- before any live
+state changes, so a rejected import never leaves a partially configured
+instance.
+
+A restore requires the target instance to have the same locale list as the
+snapshot. Use :meth:`Faker.from_snapshot() <faker.proxy.Faker.from_snapshot>`
+to construct a new instance instead. Unknown snapshot versions and mismatched
+built-in provider layouts raise an ``IncompatibleSnapshotError``.
+
+Concurrency boundary
+~~~~~~~~~~~~~~~~~~~~
+
+Snapshots and restores are serialized by per-instance re-entrant locks. An
+export acquires the proxy's lock and every child factory's lock for the whole
+capture, while a restore validates everything first and then publishes all
+changes inside the same locks. Consequently, a snapshot observed concurrently
+with a restore is always either the complete old state or the complete new
+state -- never a mixture. Calls through ``.unique`` hold the proxy lock while
+they generate and record a value, so the value history is captured
+consistently even while other threads are generating. Individual random draws
+are atomic under CPython, so a snapshot can never capture a torn random state.
+
+Pickling and deep copying are unaffected: instances made up entirely of
+built-in providers continue to be copied and pickled exactly as before.

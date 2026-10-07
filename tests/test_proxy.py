@@ -188,8 +188,12 @@ class TestFakerProxyClass:
         fake = Faker()
         internal_factory = fake.factories[0]
 
-        # Test if `Generator` attributes are proxied properly
-        for attr in fake.generator_attrs:
+        # Test if `Generator` attributes are proxied properly. Names defined
+        # on Faker itself (e.g. `snapshot`, `restore`, and snapshot helpers)
+        # are Faker-level methods and are not proxied 1:1 to the generator.
+        faker_owned = set(dir(Faker))
+        proxy_attrs = [attr for attr in fake.generator_attrs if attr not in faker_owned]
+        for attr in proxy_attrs:
             assert getattr(fake, attr) == getattr(internal_factory, attr)
 
         # Test if `random` getter and setter are proxied properly
@@ -210,8 +214,12 @@ class TestFakerProxyClass:
     def test_multiple_locale_proxy_behavior(self):
         fake = Faker(["de-DE", "en-US", "en-PH", "ja-JP"])
 
-        # `Generator` attributes are not implemented
-        for attr in fake.generator_attrs:
+        # `Generator` attributes are not implemented. Names defined on Faker
+        # itself (e.g. `snapshot`/`restore` and snapshot helpers) are
+        # Faker-level operations that support multiple locales.
+        faker_owned = set(dir(Faker))
+        proxy_attrs = [attr for attr in fake.generator_attrs if attr not in faker_owned]
+        for attr in proxy_attrs:
             with pytest.raises(NotImplementedError):
                 getattr(fake, attr)
 
@@ -427,6 +435,7 @@ class TestFakerProxyClass:
                 "_locales",
                 "_factory_map",
                 "_weights",
+                "_state_lock",
                 "_unique_proxy",
                 "_optional_proxy",
             ]

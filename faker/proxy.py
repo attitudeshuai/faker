@@ -3,15 +3,22 @@ from __future__ import annotations
 import copy
 import functools
 import re
+import threading
 
 from collections import OrderedDict
 from random import Random
 from typing import Any, Callable, Pattern, Sequence, TypeVar
 
 from .config import DEFAULT_LOCALE
-from .exceptions import UniquenessException
+from .exceptions import IncompatibleSnapshotError, UniquenessException
 from .factory import Factory
 from .generator import Generator
+from .snapshot import (
+    SNAPSHOT_VERSION,
+    decode_seen,
+    encode_seen,
+    faker_version,
+)
 from .typing import SeedType
 from .utils.distribution import choices_distribution
 
@@ -39,6 +46,7 @@ class Faker:
     ) -> None:
         self._factory_map: OrderedDict[str, Generator | Faker] = OrderedDict()
         self._weights = None
+        self._state_lock = threading.RLock()
         self._unique_proxy = UniqueProxy(self)
         self._optional_proxy = OptionalProxy(self)
 
@@ -142,6 +150,7 @@ class Faker:
         cls = self.__class__
         result = cls.__new__(cls)
         memodict[id(self)] = result
+        result._state_lock = threading.RLock()
         result._locales = copy.deepcopy(self._locales, memodict)
         result._factory_map = copy.deepcopy(self._factory_map, memodict)
         result._factories = list(result._factory_map.values())
@@ -151,8 +160,13 @@ class Faker:
         result._optional_proxy = OptionalProxy(result)
         return result
 
+    def __getstate__(self) -> dict:
+        # Locks are not picklable and are recreated on unpickle.
+        return {key: value for key, value in self.__dict__.items() if key != "_state_lock"}
+
     def __setstate__(self, state: Any) -> None:
         self.__dict__.update(state)
+        self._state_lock = threading.RLock()
 
     @property
     def unique(self) -> UniqueProxy:
@@ -297,6 +311,300 @@ class Faker:
     def items(self) -> list[tuple[str, Generator | Faker]]:
         return list(self._factory_map.items())
 
+    # ------------------------------------------------------------------
+    # State snapshot
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Export this Faker's full generator state as a portable,
+        JSON-compatible dictionary.
+
+        The snapshot covers, for every locale: the random source position,
+        the argument groups, and descriptions of all runtime-registered
+        providers, plus this proxy's locale weights, provider-method
+        selection cache, and ``.unique`` value history.
+
+        The export takes this instance's state lock and every child
+        factory's lock, so a concurrent :meth:`restore` can only be
+        observed fully applied or not applied at all -- never a mixture.
+        """
+        with self._state_lock:
+            child_locks = self._acquire_child_locks()
+            try:
+                return self._snapshot_locked()
+            finally:
+                self._release_child_locks(child_locks)
+
+    def restore(self, snapshot: dict) -> None:
+        """Replace this Faker's generator state with ``snapshot``.
+
+        The whole snapshot (version marker, locale layout, built-in
+        providers, custom provider classes, unique history, caches) is
+        decoded and validated, and all runtime provider objects are
+        constructed, before any live state changes. A rejected import
+        therefore raises without leaving a partially restored instance.
+
+        The target instance must have the same locale list as the
+        snapshot; use :meth:`from_snapshot` to build a new instance
+        instead.
+        """
+        with self._state_lock:
+            child_locks = self._acquire_child_locks()
+            try:
+                plan = self._plan_restore(snapshot)
+                self._publish_restore(plan)
+            finally:
+                self._release_child_locks(child_locks)
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict) -> Faker:
+        """Build a new Faker instance from ``snapshot``.
+
+        All factories are constructed from the recorded built-in provider
+        lists and the runtime providers are then re-registered, so the new
+        instance continues the same random sequence from the recorded
+        position even in a different process.
+        """
+        if not isinstance(snapshot, dict):
+            raise IncompatibleSnapshotError("Snapshot must be a dictionary")
+        if snapshot.get("snapshot_version") != SNAPSHOT_VERSION:
+            raise IncompatibleSnapshotError(
+                f"Unsupported snapshot version {snapshot.get('snapshot_version')!r}; " f"expected {SNAPSHOT_VERSION}"
+            )
+        if snapshot.get("object", "faker") != "faker":
+            raise IncompatibleSnapshotError(f"Expected a Faker snapshot, got {snapshot.get('object')!r}")
+
+        locales = snapshot.get("locales")
+        if not isinstance(locales, list) or not locales or not all(isinstance(code, str) for code in locales):
+            raise IncompatibleSnapshotError("Malformed 'locales' section in snapshot")
+
+        weights = snapshot.get("weights")
+        if weights is not None and (not isinstance(weights, list) or len(weights) != len(locales)):
+            raise IncompatibleSnapshotError("Malformed 'weights' section in snapshot")
+
+        specs = cls._collect_builtin_specs(snapshot)
+        use_weighting = cls._collect_use_weighting(snapshot)
+
+        if weights:
+            locale_arg: Any = OrderedDict(zip(locales, weights))
+        elif len(locales) == 1:
+            locale_arg = locales[0]
+        else:
+            locale_arg = list(locales)
+
+        primary_spec = specs[locales[0]]
+        instance = cls(locale_arg, providers=list(primary_spec), use_weighting=use_weighting)
+
+        # Children with a different built-in provider set are rebuilt.
+        for locale in locales[1:]:
+            if specs[locale] != primary_spec:
+                instance._factory_map[locale] = cls(locale, providers=list(specs[locale]), use_weighting=use_weighting)
+        instance._factories = list(instance._factory_map.values())
+
+        instance.restore(snapshot)
+        return instance
+
+    @classmethod
+    def _collect_builtin_specs(cls, data: dict) -> dict:
+        specs = {}
+        for locale, child_data in data["factories"].items():
+            leaf = cls._generator_data(child_data)
+            spec = leaf.get("builtin_spec")
+            if not isinstance(spec, list) or not all(isinstance(path, str) for path in spec):
+                raise IncompatibleSnapshotError(f"Malformed built-in provider spec for locale {locale!r}")
+            specs[locale] = spec
+        return specs
+
+    @classmethod
+    def _collect_use_weighting(cls, data: dict) -> bool:
+        return bool(cls._generator_data(data).get("use_weighting", True))
+
+    @classmethod
+    def _generator_data(cls, data: dict) -> dict:
+        """Walk nested Faker snapshots until the leaf generator data."""
+        if data.get("object") == "generator":
+            return data
+        factories = data["factories"]
+        first_key = next(iter(factories))
+        return cls._generator_data(factories[first_key])
+
+    def _snapshot_locked(self) -> dict:
+        factories_data: OrderedDict[str, Any] = OrderedDict()
+        for locale, factory in self._factory_map.items():
+            if isinstance(factory, Faker):
+                factories_data[locale] = factory._snapshot_locked()
+            else:
+                factories_data[locale] = factory._build_snapshot()
+
+        leaf = self._generator_data(factories_data[self._locales[0]])
+        return {
+            "object": "faker",
+            "snapshot_version": SNAPSHOT_VERSION,
+            "faker_version": faker_version(),
+            "locales": list(self._locales),
+            "weights": list(self._weights) if self._weights else None,
+            "use_weighting": leaf.get("use_weighting", True),
+            "factories": factories_data,
+            "unique": encode_seen(self._unique_proxy._seen, self._unique_proxy._sentinel),
+            "caches": self._export_caches(),
+        }
+
+    def _plan_restore(self, data: dict) -> dict:
+        if not isinstance(data, dict):
+            raise IncompatibleSnapshotError("Snapshot must be a dictionary")
+        if data.get("snapshot_version") != SNAPSHOT_VERSION:
+            raise IncompatibleSnapshotError(
+                f"Unsupported snapshot version {data.get('snapshot_version')!r}; " f"expected {SNAPSHOT_VERSION}"
+            )
+        if data.get("object", "faker") != "faker":
+            raise IncompatibleSnapshotError(f"Expected a Faker snapshot, got {data.get('object')!r}")
+
+        locales = data.get("locales")
+        if locales != self._locales:
+            raise IncompatibleSnapshotError(
+                f"Snapshot locales {locales!r} do not match target locales {self._locales!r}"
+            )
+
+        weights = data.get("weights")
+        if weights is not None:
+            if not isinstance(weights, list) or len(weights) != len(locales):
+                raise IncompatibleSnapshotError("Malformed 'weights' section in snapshot")
+            weights = list(weights)
+
+        factories_data = data.get("factories")
+        if not isinstance(factories_data, dict) or set(factories_data) != set(locales):
+            raise IncompatibleSnapshotError("Malformed 'factories' section in snapshot")
+
+        child_plans = []
+        for locale in locales:
+            child = self._factory_map[locale]
+            child_data = factories_data[locale]
+            if isinstance(child, Faker):
+                if child_data.get("object", "faker") != "faker":
+                    raise IncompatibleSnapshotError(f"Expected a Faker snapshot for locale {locale!r}")
+                child_plan = child._plan_restore(child_data)
+            else:
+                if child_data.get("object") != "generator":
+                    raise IncompatibleSnapshotError(f"Expected a generator snapshot for locale {locale!r}")
+                child_plan = child._plan_restore(child_data)
+            child_plans.append((locale, child_plan))
+
+        seen = decode_seen(data.get("unique", []))
+        cache_plan = self._plan_caches(data.get("caches", []))
+
+        return {
+            "weights": weights,
+            "factories": child_plans,
+            "seen": seen,
+            "caches": cache_plan,
+        }
+
+    def _publish_restore(self, plan: dict) -> None:
+        # Restore child factories first while all their locks are held.
+        for locale, child_plan in plan["factories"]:
+            self._factory_map[locale]._publish_restore(child_plan)
+
+        self._weights = plan["weights"]
+
+        # Replace the unique history atomically, tagging every pool with this
+        # proxy's current sentinel.
+        seen = plan["seen"]
+        sentinel = self._unique_proxy._sentinel
+        for values in seen.values():
+            values.add(sentinel)
+        self._unique_proxy._seen = seen
+
+        # Reset the selection cache to exactly what the snapshot describes so
+        # stale cached mappings never survive an import.
+        for attr in list(self.__dict__):
+            if self.cache_pattern.match(attr):
+                del self.__dict__[attr]
+        for entry in plan["caches"]:
+            compatible_factories = [self._factory_map[locale] for locale in entry["factories"]]
+            setattr(
+                self,
+                f"_cached_{entry['method']}_mapping",
+                (compatible_factories, entry["weights"]),
+            )
+
+        self._factories = list(self._factory_map.values())
+
+    # -- selection cache ------------------------------------------------
+
+    def _export_caches(self) -> list:
+        entries = []
+        for attr, value in self.__dict__.items():
+            if not self.cache_pattern.match(attr):
+                continue
+            method_name = attr[len("_cached_") : -len("_mapping")]
+            compatible_factories, entry_weights = value
+            factory_locales = [
+                locale for locale, factory in self._factory_map.items() if factory in compatible_factories
+            ]
+            entries.append(
+                {
+                    "method": method_name,
+                    "factories": factory_locales,
+                    "weights": list(entry_weights) if entry_weights else None,
+                }
+            )
+        entries.sort(key=lambda entry: entry["method"])
+        return entries
+
+    def _plan_caches(self, data: Any) -> list:
+        if not isinstance(data, list):
+            raise IncompatibleSnapshotError("Malformed 'caches' section in snapshot")
+        planned = []
+        seen_methods = set()
+        for entry in data:
+            if not isinstance(entry, dict):
+                raise IncompatibleSnapshotError(f"Malformed cache entry: {entry!r}")
+            method_name = entry.get("method")
+            factory_locales = entry.get("factories")
+            entry_weights = entry.get("weights")
+            if not isinstance(method_name, str) or not isinstance(factory_locales, list):
+                raise IncompatibleSnapshotError(f"Malformed cache entry: {entry!r}")
+            if method_name in seen_methods:
+                raise IncompatibleSnapshotError(f"Duplicate cache entry for {method_name!r}")
+            seen_methods.add(method_name)
+            for locale in factory_locales:
+                if locale not in self._factory_map:
+                    raise IncompatibleSnapshotError(f"Cache for {method_name!r} references unknown locale {locale!r}")
+                if not hasattr(self._factory_map[locale], method_name):
+                    raise IncompatibleSnapshotError(
+                        f"Cache for {method_name!r} references locale {locale!r}, which "
+                        f"does not provide that method"
+                    )
+            if entry_weights is not None and len(entry_weights) != len(factory_locales):
+                raise IncompatibleSnapshotError(f"Cache for {method_name!r} has mismatched weights")
+            planned.append(
+                {
+                    "method": method_name,
+                    "factories": list(factory_locales),
+                    "weights": (list(entry_weights) if entry_weights is not None else None),
+                }
+            )
+        return planned
+
+    # -- child lock handling --------------------------------------------
+
+    def _acquire_child_locks(self) -> list:
+        locks = []
+        try:
+            for factory in self._factory_map.values():
+                lock = factory._state_lock
+                lock.acquire()
+                locks.append(lock)
+        except BaseException:
+            for lock in reversed(locks):
+                lock.release()
+            raise
+        return locks
+
+    def _release_child_locks(self, locks: list) -> None:
+        for lock in reversed(locks):
+            lock.release()
+
 
 class UniqueProxy:
     def __init__(self, proxy: Faker, excluded_types: tuple[type, ...] = ()):
@@ -366,42 +674,46 @@ class UniqueProxy:
     def _wrap(self, name: str, function: Callable) -> Callable:
         @functools.wraps(function)
         def wrapper(*args, **kwargs):
-            # If types are excluded, call function once to check return type
-            if self._excluded_types:
-                retval = function(*args, **kwargs)
-                # Skip uniqueness check if type is excluded
-                if isinstance(retval, self._excluded_types):
-                    return retval
-                # If not excluded, continue with normal uniqueness logic
-                # but we already have a value, so we'll use it if unique
-                hashable_retval = self._make_hashable(retval)
-                key = (name, args, tuple(sorted(kwargs.items())))
-                generated = self._seen.setdefault(key, {self._sentinel})
+            # Hold the proxy's state lock while generating and recording the
+            # value, so a concurrent snapshot/restore observes either the
+            # complete old history or the complete new history.
+            with self._proxy._state_lock:
+                # If types are excluded, call function once to check return type
+                if self._excluded_types:
+                    retval = function(*args, **kwargs)
+                    # Skip uniqueness check if type is excluded
+                    if isinstance(retval, self._excluded_types):
+                        return retval
+                    # If not excluded, continue with normal uniqueness logic
+                    # but we already have a value, so we'll use it if unique
+                    hashable_retval = self._make_hashable(retval)
+                    key = (name, args, tuple(sorted(kwargs.items())))
+                    generated = self._seen.setdefault(key, {self._sentinel})
 
-                # Check if this first value is unique
-                if hashable_retval not in generated:
-                    generated.add(hashable_retval)
-                    return retval
-                # Not unique, continue with normal loop below
-            else:
-                # No exclusions, use original logic
-                key = (name, args, tuple(sorted(kwargs.items())))
-                generated = self._seen.setdefault(key, {self._sentinel})
-                retval = self._sentinel
-                hashable_retval = self._make_hashable(retval)
+                    # Check if this first value is unique
+                    if hashable_retval not in generated:
+                        generated.add(hashable_retval)
+                        return retval
+                    # Not unique, continue with normal loop below
+                else:
+                    # No exclusions, use original logic
+                    key = (name, args, tuple(sorted(kwargs.items())))
+                    generated = self._seen.setdefault(key, {self._sentinel})
+                    retval = self._sentinel
+                    hashable_retval = self._make_hashable(retval)
 
-            # Original uniqueness logic (with potential first attempt already done)
-            for i in range(_UNIQUE_ATTEMPTS):
-                if hashable_retval not in generated:
-                    break
-                retval = function(*args, **kwargs)
-                hashable_retval = self._make_hashable(retval)
-            else:
-                raise UniquenessException(f"Got duplicated values after {_UNIQUE_ATTEMPTS:,} iterations.")
+                # Original uniqueness logic (with potential first attempt already done)
+                for i in range(_UNIQUE_ATTEMPTS):
+                    if hashable_retval not in generated:
+                        break
+                    retval = function(*args, **kwargs)
+                    hashable_retval = self._make_hashable(retval)
+                else:
+                    raise UniquenessException(f"Got duplicated values after {_UNIQUE_ATTEMPTS:,} iterations.")
 
-            generated.add(hashable_retval)
+                generated.add(hashable_retval)
 
-            return retval
+                return retval
 
         return wrapper
 

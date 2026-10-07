@@ -47,6 +47,11 @@ class Factory:
         config["use_weighting"] = use_weighting
         _providers = (providers or PROVIDERS) + includes
 
+        # Only generators created here get an exact baseline marker. When a
+        # caller supplies a pre-existing generator, its provider chain may
+        # already contain other providers, so snapshots fall back to the
+        # class-identity heuristic instead of recording a misleading count.
+        created_generator = generator is None
         faker = generator or Generator(**config)
 
         for prov_name in _providers:
@@ -59,6 +64,9 @@ class Factory:
             provider.__provider__ = prov_name
             provider.__lang__ = lang_found
             faker.add_provider(provider)
+
+        if created_generator:
+            faker._factory_baseline = len(faker.providers)
 
         return faker
 

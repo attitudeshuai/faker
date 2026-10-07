@@ -10,9 +10,18 @@ import uuid
 import zipfile
 
 from json import JSONEncoder
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, Union, overload
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Type, Union, cast, overload
 
-from faker.exceptions import UnsupportedFeature
+from faker.chunked import (
+    CHUNKED_FORMATS,
+    DEFAULT_MAX_CHUNKS,
+    DEFAULT_MAX_FAILURES,
+    ChunkedProduction,
+    ChunkSpec,
+    FailurePolicy,
+    create_chunked_production,
+)
+from faker.exceptions import ChunkConfigurationError, UnsupportedFeature
 
 from .. import BaseProvider
 from ..python import TypesSpec
@@ -528,8 +537,9 @@ class Provider(BaseProvider):
         data_columns: Tuple[str, str] = ("{{name}}", "{{address}}"),
         num_rows: int = 10,
         include_row_ids: bool = False,
+        chunk: Optional[ChunkSpec] = None,
         **fmtparams: Any,
-    ) -> str:
+    ) -> Union[str, ChunkedProduction]:
         """Generate random delimiter-separated values.
 
         This method's behavior share some similarities with ``csv.writer``. The ``dialect`` and
@@ -551,12 +561,30 @@ class Provider(BaseProvider):
             fake.dsv(data_columns=('{{ name }}', '{{ pyint:top_half }}'))
 
         The ``num_rows`` argument controls how many rows of data to generate, and the ``include_row_ids``
-        argument may be set to ``True`` to include a sequential row ID column.
+        argument may be set ``True`` to include a sequential row ID column.
+
+        When ``chunk`` is a :class:`~faker.chunked.ChunkSpec` declaration, no string is
+        assembled: a :class:`~faker.chunked.ChunkedProduction` session is returned instead and
+        rows are delivered one chunk at a time, each chunk carrying its own completion status.
+        Without a chunk declaration the one-shot behavior is unchanged.
 
         :sample: dialect='excel', data_columns=('{{name}}', '{{address}}')
         :sample: dialect='excel-tab', data_columns=('{{name}}', '{{address}}'), include_row_ids=True
         :sample: data_columns=('{{name}}', '{{address}}'), num_rows=5, delimiter='$'
         """
+
+        if chunk is not None:
+            return create_chunked_production(
+                self,
+                "dsv",
+                chunk,
+                dialect=dialect,
+                header=header,
+                data_columns=data_columns,
+                num_rows=num_rows,
+                include_row_ids=include_row_ids,
+                fmtparams=fmtparams,
+            )
 
         if not isinstance(num_rows, int) or num_rows <= 0:
             raise ValueError("`num_rows` must be a positive integer")
@@ -592,24 +620,29 @@ class Provider(BaseProvider):
         data_columns: Tuple[str, str] = ("{{name}}", "{{address}}"),
         num_rows: int = 10,
         include_row_ids: bool = False,
-    ) -> str:
+        chunk: Optional[ChunkSpec] = None,
+    ) -> Union[str, ChunkedProduction]:
         """Generate random comma-separated values.
 
         For more information on the different arguments of this method, please refer to
         :meth:`dsv() <faker.providers.misc.Provider.dsv>` which is used under the hood.
+        Pass ``chunk=ChunkSpec(...)`` to receive a chunked production session instead.
 
         :sample: data_columns=('{{name}}', '{{address}}'), num_rows=10, include_row_ids=False
         :sample: header=('Name', 'Address', 'Favorite Color'),
                 data_columns=('{{name}}', '{{address}}', '{{safe_color_name}}'),
                 num_rows=10, include_row_ids=True
         """
-        return self.dsv(
-            header=header,
-            data_columns=data_columns,
-            num_rows=num_rows,
-            include_row_ids=include_row_ids,
-            delimiter=",",
-        )
+        dsv_kwargs: Dict[str, Any] = {
+            "header": header,
+            "data_columns": data_columns,
+            "num_rows": num_rows,
+            "include_row_ids": include_row_ids,
+            "delimiter": ",",
+        }
+        if chunk is not None:
+            dsv_kwargs["chunk"] = chunk
+        return self.dsv(**dsv_kwargs)
 
     def tsv(
         self,
@@ -617,24 +650,29 @@ class Provider(BaseProvider):
         data_columns: Tuple[str, str] = ("{{name}}", "{{address}}"),
         num_rows: int = 10,
         include_row_ids: bool = False,
-    ) -> str:
+        chunk: Optional[ChunkSpec] = None,
+    ) -> Union[str, ChunkedProduction]:
         """Generate random tab-separated values.
 
         For more information on the different arguments of this method, please refer to
         :meth:`dsv() <faker.providers.misc.Provider.dsv>` which is used under the hood.
+        Pass ``chunk=ChunkSpec(...)`` to receive a chunked production session instead.
 
         :sample: data_columns=('{{name}}', '{{address}}'), num_rows=10, include_row_ids=False
         :sample: header=('Name', 'Address', 'Favorite Color'),
                 data_columns=('{{name}}', '{{address}}', '{{safe_color_name}}'),
                 num_rows=10, include_row_ids=True
         """
-        return self.dsv(
-            header=header,
-            data_columns=data_columns,
-            num_rows=num_rows,
-            include_row_ids=include_row_ids,
-            delimiter="\t",
-        )
+        dsv_kwargs: Dict[str, Any] = {
+            "header": header,
+            "data_columns": data_columns,
+            "num_rows": num_rows,
+            "include_row_ids": include_row_ids,
+            "delimiter": "\t",
+        }
+        if chunk is not None:
+            dsv_kwargs["chunk"] = chunk
+        return self.dsv(**dsv_kwargs)
 
     def psv(
         self,
@@ -642,24 +680,29 @@ class Provider(BaseProvider):
         data_columns: Tuple[str, str] = ("{{name}}", "{{address}}"),
         num_rows: int = 10,
         include_row_ids: bool = False,
-    ) -> str:
+        chunk: Optional[ChunkSpec] = None,
+    ) -> Union[str, ChunkedProduction]:
         """Generate random pipe-separated values.
 
         For more information on the different arguments of this method, please refer to
         :meth:`dsv() <faker.providers.misc.Provider.dsv>` which is used under the hood.
+        Pass ``chunk=ChunkSpec(...)`` to receive a chunked production session instead.
 
         :sample: data_columns=('{{name}}', '{{address}}'), num_rows=10, include_row_ids=False
         :sample: header=('Name', 'Address', 'Favorite Color'),
                 data_columns=('{{name}}', '{{address}}', '{{safe_color_name}}'),
                 num_rows=10, include_row_ids=True
         """
-        return self.dsv(
-            header=header,
-            data_columns=data_columns,
-            num_rows=num_rows,
-            include_row_ids=include_row_ids,
-            delimiter="|",
-        )
+        dsv_kwargs: Dict[str, Any] = {
+            "header": header,
+            "data_columns": data_columns,
+            "num_rows": num_rows,
+            "include_row_ids": include_row_ids,
+            "delimiter": "|",
+        }
+        if chunk is not None:
+            dsv_kwargs["chunk"] = chunk
+        return self.dsv(**dsv_kwargs)
 
     def json_bytes(
         self,
@@ -667,14 +710,30 @@ class Provider(BaseProvider):
         num_rows: int = 10,
         indent: Optional[int] = None,
         cls: Optional[Type[JSONEncoder]] = None,
-    ) -> bytes:
+        chunk: Optional[ChunkSpec] = None,
+    ) -> Union[bytes, ChunkedProduction]:
         """
         Generate random JSON structure and return as bytes.
 
         For more information on the different arguments of this method, refer to
         :meth:`json() <faker.providers.misc.Provider.json>` which is used under the hood.
+        Pass ``chunk=ChunkSpec(...)`` to receive a chunked production session whose
+        payloads are bytes.
         """
-        return self.json(data_columns=data_columns, num_rows=num_rows, indent=indent, cls=cls).encode()
+        if chunk is not None:
+            return create_chunked_production(
+                self,
+                "json_bytes",
+                chunk,
+                data_columns=data_columns,
+                num_rows=num_rows,
+                indent=indent,
+                cls=cls,
+            )
+        return cast(
+            str,
+            self.json(data_columns=data_columns, num_rows=num_rows, indent=indent, cls=cls),
+        ).encode()
 
     def json(
         self,
@@ -682,7 +741,8 @@ class Provider(BaseProvider):
         num_rows: int = 10,
         indent: Optional[int] = None,
         cls: Optional[Type[JSONEncoder]] = None,
-    ) -> str:
+        chunk: Optional[ChunkSpec] = None,
+    ) -> Union[str, ChunkedProduction]:
         """
         Generate random JSON structure values.
 
@@ -727,6 +787,17 @@ class Provider(BaseProvider):
         :sample: data_columns=[('Name', 'name'), ('Points', 'pyint',
                 {'min_value': 50, 'max_value': 100})], num_rows=1
         """
+        if chunk is not None:
+            return create_chunked_production(
+                self,
+                "json",
+                chunk,
+                data_columns=data_columns,
+                num_rows=num_rows,
+                indent=indent,
+                cls=cls,
+            )
+
         default_data_columns = {
             "name": "{{name}}",
             "residency": "{{address}}",
@@ -815,7 +886,13 @@ class Provider(BaseProvider):
         _dict = {self.generator.word(): _dict}
         return xmltodict.unparse(_dict)
 
-    def fixed_width(self, data_columns: Optional[DataColumns] = None, num_rows: int = 10, align: str = "left") -> str:
+    def fixed_width(
+        self,
+        data_columns: Optional[DataColumns] = None,
+        num_rows: int = 10,
+        align: str = "left",
+        chunk: Optional[ChunkSpec] = None,
+    ) -> Union[str, ChunkedProduction]:
         """
         Generate random fixed width values.
 
@@ -851,6 +928,16 @@ class Provider(BaseProvider):
         :sample: data_columns=[(20, 'name'), (3, 'pyint', {'min_value': 50,
                 'max_value': 100})], align='right', num_rows=2
         """
+        if chunk is not None:
+            return create_chunked_production(
+                self,
+                "fixed_width",
+                chunk,
+                data_columns=data_columns,
+                num_rows=num_rows,
+                align=align,
+            )
+
         default_data_columns = [
             (20, "name"),
             (3, "pyint", {"max_value": 20}),
@@ -878,6 +965,84 @@ class Provider(BaseProvider):
 
             data.append("".join(row))
         return "\n".join(data)
+
+    def produce_chunks(
+        self,
+        format: Optional[str] = None,
+        spec: Optional[ChunkSpec] = None,
+        **kwargs: Any,
+    ) -> ChunkedProduction:
+        """Start a chunked structured-output production.
+
+        This is the generic entry point of the chunked delivery pathway.  ``format``
+        is one of ``'dsv'``, ``'csv'``, ``'tsv'``, ``'psv'``, ``'json'``,
+        ``'json_bytes'`` or ``'fixed_width'``; the remaining keyword arguments are
+        the usual arguments of the matching one-shot producer (e.g. ``data_columns``,
+        ``num_rows``, ``header``, ``indent``, ``align``).
+
+        Chunking is declared either by passing a :class:`~faker.chunked.ChunkSpec`
+        as ``spec``::
+
+            session = fake.produce_chunks(
+                "csv",
+                spec=ChunkSpec(rows_per_chunk=5, failure_policy="skip"),
+                data_columns=("{{name}}", "{{address}}"),
+                num_rows=20,
+            )
+            for chunk in session:
+                ...  # chunk.status / chunk.payload / chunk.failures
+
+        or by declaring ``rows_per_chunk`` inline (optionally together with
+        ``failure_policy``, ``replacement``, ``max_chunks`` and ``max_failures``)::
+
+            session = fake.produce_chunks(
+                "json", rows_per_chunk=10, failure_policy="abort",
+                data_columns={"name": "name"}, num_rows=100,
+            )
+
+        Already delivered chunks are never recomputed; iterating (or calling
+        ``session.next_chunk()``) always continues at the next chunk.  Each session
+        is fully independent, so concurrent productions never share progress,
+        buffers or failure lists.
+
+        :param format: name of the structured-output format to produce
+        :param spec: explicit chunk declaration (mutually exclusive with the
+            inline ``rows_per_chunk``/``failure_policy``/``replacement``/
+            ``max_chunks``/``max_failures`` arguments)
+        """
+        if format is None or not isinstance(format, str):
+            raise ChunkConfigurationError(
+                "`produce_chunks` requires an output format name; expected one of "
+                + ", ".join(repr(name) for name in CHUNKED_FORMATS),
+            )
+        if format not in CHUNKED_FORMATS:
+            raise ChunkConfigurationError(
+                f"Unsupported chunked output format {format!r}; expected one of "
+                + ", ".join(repr(name) for name in CHUNKED_FORMATS),
+            )
+
+        spec_option_names = ("rows_per_chunk", "failure_policy", "replacement", "max_chunks", "max_failures")
+        inline_options = {name: kwargs.pop(name) for name in spec_option_names if name in kwargs}
+
+        if spec is not None:
+            if inline_options:
+                raise ChunkConfigurationError(
+                    "Pass either `spec=ChunkSpec(...)` or inline chunk options "
+                    f"({', '.join(sorted(inline_options))}), not both",
+                )
+        else:
+            if "rows_per_chunk" not in inline_options:
+                raise ChunkConfigurationError(
+                    "Chunked output requires a `ChunkSpec` (`spec=...`) or an inline " "`rows_per_chunk` declaration",
+                )
+            inline_options.setdefault("failure_policy", FailurePolicy.SKIP)
+            inline_options.setdefault("replacement", None)
+            inline_options.setdefault("max_chunks", DEFAULT_MAX_CHUNKS)
+            inline_options.setdefault("max_failures", DEFAULT_MAX_FAILURES)
+            spec = ChunkSpec(**inline_options)
+
+        producer = getattr(self, format)
+        return producer(chunk=spec, **kwargs)
 
     def _value_format_selection(self, definition: str, **kwargs: Any) -> Union[int, str]:
         """

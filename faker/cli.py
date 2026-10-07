@@ -1,5 +1,6 @@
 import argparse
 import itertools
+import json
 import logging
 import os
 import random
@@ -8,9 +9,10 @@ import textwrap
 
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Dict, List, Optional, TextIO, TypeVar, Union
+from typing import Dict, List, Optional, TextIO, TypeVar, Union, cast
 
 from . import VERSION, Faker, documentor, exceptions
+from .chunked import CHUNKED_FORMATS, ChunkedProduction, ChunkSpec
 from .config import AVAILABLE_LOCALES, DEFAULT_LOCALE, META_PROVIDERS_MODULES
 from .documentor import Documentor
 from .providers import BaseProvider
@@ -237,6 +239,52 @@ examples:
         )
 
         parser.add_argument(
+            "--chunk-size",
+            metavar="ROWS",
+            type=int,
+            default=None,
+            help="stream the structured fake named by the positional argument "
+            "(one of: {formats}) chunk by chunk, with ROWS rows per chunk. "
+            "Each chunk is written and flushed immediately, and '-r/--repeat' "
+            "sets the total number of rows.".format(formats=", ".join(CHUNKED_FORMATS)),
+        )
+        parser.add_argument(
+            "--on-error",
+            choices=["skip", "replace", "abort"],
+            default="skip",
+            help="row failure policy for chunked output: 'skip' omits the row, "
+            "'replace' substitutes it with --replace-with, 'abort' invalidates "
+            "the chunk (default: skip)",
+        )
+        parser.add_argument(
+            "--replace-with",
+            metavar="VALUE",
+            default=None,
+            help="substitute value for failing rows when --on-error=replace",
+        )
+        parser.add_argument(
+            "--max-chunks",
+            metavar="N",
+            type=int,
+            default=None,
+            help="maximum number of chunks a chunked production may deliver",
+        )
+        parser.add_argument(
+            "--max-failures",
+            metavar="N",
+            type=int,
+            default=None,
+            help="maximum number of row failures a chunked production may record",
+        )
+        parser.add_argument(
+            "--failure-log",
+            metavar="PATH",
+            default=None,
+            help="write the chunked-output failure list (row, column, definition, "
+            "error) as JSON to PATH; the file is only created when failures occur",
+        )
+
+        parser.add_argument(
             "-i",
             "--include",
             action="append",
@@ -273,6 +321,18 @@ examples:
         else:
             logging.basicConfig(level=logging.CRITICAL)
 
+        if arguments.chunk_size is not None:
+            if not arguments.fake:
+                parser.error("chunked output requires a structured fake name: " + ", ".join(CHUNKED_FORMATS))
+            if arguments.fake not in CHUNKED_FORMATS:
+                parser.error(
+                    f"chunked output only supports {', '.join(CHUNKED_FORMATS)}, not {arguments.fake!r}",
+                )
+            if arguments.fake_args:
+                parser.error("chunked output does not accept positional fake arguments")
+            self._execute_chunked(arguments)
+            return
+
         random.seed(arguments.seed)
         seeds = [random.random() for _ in range(arguments.repeat)]
 
@@ -290,6 +350,107 @@ examples:
             if not arguments.fake:
                 # repeat not supported for all docs
                 break
+
+    def _execute_chunked(self, arguments: argparse.Namespace) -> None:
+        """Stream one structured fake in chunks instead of a one-shot loop.
+
+        Every chunk is written and flushed as soon as it is delivered, so the
+        output always ends in a well-defined state, and the accumulated row
+        failure list can be written to ``--failure-log``.
+        """
+        spec_kwargs = {
+            "rows_per_chunk": arguments.chunk_size,
+            "failure_policy": "abort_chunk" if arguments.on_error == "abort" else arguments.on_error,
+            "replacement": arguments.replace_with,
+        }
+        if arguments.max_chunks is not None:
+            spec_kwargs["max_chunks"] = arguments.max_chunks
+        if arguments.max_failures is not None:
+            spec_kwargs["max_failures"] = arguments.max_failures
+
+        output: TextIO = arguments.o
+        delivered = 0
+        invalidated = 0
+        session = None
+        rejected = False
+
+        try:
+            spec = ChunkSpec(**spec_kwargs)
+            fake = Faker(locale=arguments.lang, includes=arguments.include)
+            fake.seed_instance(arguments.seed)
+            session = fake.produce_chunks(
+                arguments.fake,
+                spec,
+                num_rows=arguments.repeat,
+            )
+            for chunk in session:
+                payload = chunk.payload
+                if isinstance(payload, bytes):
+                    payload = payload.decode()
+                output.write(payload)
+                output.write(arguments.sep)
+                output.flush()
+                delivered += 1
+                if chunk.status.value == "invalidated":
+                    invalidated += 1
+        except exceptions.ChunkedProductionError as exc:
+            rejected = True
+            print(f"chunked output rejected: {exc}", file=sys.stderr)
+        finally:
+            failure_count = self._finalize_chunked_output(output, delivered, session, arguments.failure_log)
+
+        if failure_count:
+            print(
+                f"chunked output finished with {failure_count} row failure(s) "
+                f"handled by policy {arguments.on_error!r}"
+                + (f", {invalidated} chunk(s) invalidated" if invalidated else ""),
+                file=sys.stderr,
+            )
+
+        if rejected:
+            raise SystemExit(1)
+
+    @staticmethod
+    def _finalize_chunked_output(
+        output: TextIO,
+        delivered: int,
+        session: Optional[ChunkedProduction],
+        failure_log_path: Optional[str],
+    ) -> int:
+        """Flush/close out the chunked run and persist the failure list.
+
+        Returns the number of accumulated row failures.  When nothing was
+        delivered to a real output file, the (already truncated) file is
+        removed so a rejected run leaves no empty artifact behind.
+        """
+        failures = list(session.failures) if session is not None else []
+
+        if failure_log_path and failures:
+            with open(failure_log_path, "w", encoding="utf-8") as failure_log:
+                json.dump([failure.to_dict() for failure in failures], failure_log, indent=2)
+
+        output_path = cast(Optional[str], getattr(output, "name", None))
+        is_real_file = bool(output_path) and output not in (sys.stdout, sys.stderr)
+
+        try:
+            output.flush()
+        except (OSError, ValueError):
+            pass
+
+        if delivered == 0 and is_real_file and output_path is not None:
+            # argparse opened (and truncated) the file before production
+            # started; remove it if the run never delivered anything.
+            try:
+                output.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
+                    os.remove(output_path)
+            except OSError:
+                pass
+
+        return len(failures)
 
 
 def execute_from_command_line(argv: Optional[str] = None) -> None:

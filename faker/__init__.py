@@ -1,7 +1,25 @@
+from faker.chunked import (
+    ChunkedProduction,
+    ChunkResult,
+    ChunkSpec,
+    ChunkStatus,
+    FailurePolicy,
+    RowFailure,
+)
 from faker.factory import Factory
 from faker.generator import Generator
 from faker.proxy import Faker
 
 VERSION = "40.41.0"
 
-__all__ = ("Factory", "Generator", "Faker")
+__all__ = (
+    "Factory",
+    "Faker",
+    "Generator",
+    "ChunkResult",
+    "ChunkSpec",
+    "ChunkStatus",
+    "ChunkedProduction",
+    "FailurePolicy",
+    "RowFailure",
+)

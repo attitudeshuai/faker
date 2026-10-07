@@ -1,15 +1,18 @@
 import copy
 import pickle
 import random
+import threading
+import time
 
 from collections import OrderedDict
-from unittest.mock import PropertyMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from faker import Faker
 from faker.config import DEFAULT_LOCALE
 from faker.generator import Generator
+from faker.providers import BaseProvider
 
 
 class TestFakerProxyClass:
@@ -227,25 +230,29 @@ class TestFakerProxyClass:
     def test_multiple_locale_caching_behavior(self):
         fake = Faker(["de_DE", "en-US", "en-PH", "ja_JP"])
 
-        with patch("faker.proxy.Faker._map_provider_method", wraps=fake._map_provider_method) as mock_map_method:
-            mock_map_method.assert_not_called()
-            assert not hasattr(fake, "_cached_name_mapping")
+        with patch("faker.proxy.Faker._build_mapping", wraps=fake._build_mapping) as mock_build_mapping:
+            mock_build_mapping.assert_not_called()
+            assert "name" not in fake._method_mappings
 
             # Test cache creation
             fake.name()
-            assert hasattr(fake, "_cached_name_mapping")
-            mock_map_method.assert_called_once_with("name")
+            assert "name" in fake._method_mappings
+            mock_build_mapping.assert_called_once_with("name")
 
-            # Test subsequent cache access
-            with patch.object(Faker, "_cached_name_mapping", create=True, new_callable=PropertyMock) as mock_cached_map:
-                # Keep test fast by patching the cached mapping to return something simpler
-                mock_cached_map.return_value = [fake["en_US"]], [1]
-                for _ in range(100):
-                    fake.name()
+            # Test subsequent cache access: the same snapshot is reused and the
+            # mapping is never rebuilt
+            mapping = fake._method_mappings["name"]
+            for _ in range(100):
+                fake.name()
+            assert fake._method_mappings["name"] is mapping
+            mock_build_mapping.assert_called_once_with("name")
 
-                # Python's hasattr() internally calls getattr()
-                # So each call to name() accesses the cached mapping twice
-                assert mock_cached_map.call_count == 200
+            # A weight replacement atomically invalidates the cached snapshot
+            fake.set_weights({"de_DE": 1, "en_US": 1, "en_PH": 1, "ja_JP": 1})
+            assert "name" not in fake._method_mappings
+            fake.name()
+            assert fake._method_mappings["name"] is not mapping
+            assert mock_build_mapping.call_count == 2
 
     @patch("faker.proxy.Faker._select_factory_choice")
     @patch("faker.proxy.Faker._select_factory_distribution")
@@ -429,6 +436,10 @@ class TestFakerProxyClass:
                 "_weights",
                 "_unique_proxy",
                 "_optional_proxy",
+                "_method_mappings",
+                "_selection_lock",
+                "_last_selection",
+                "_on_missing",
             ]
         )
         for factory in fake.factories:
@@ -517,3 +528,263 @@ class TestFakerProxyClass:
         fake = Faker()
         pickled = pickle.dumps(fake)
         pickle.loads(pickled)
+
+
+class TestRuntimeWeightedSelection:
+    """Runtime weight management, candidate observability and cache consistency."""
+
+    LOCALES = ["de_DE", "en_US", "en_PH", "ja_JP"]
+
+    def test_weights_default_none_and_readonly_copy(self):
+        fake = Faker(self.LOCALES)
+        assert fake.weights is None
+
+        fake.set_weights(OrderedDict(zip(self.LOCALES, [3, 2, 1, 5])))
+        snapshot = fake.weights
+        assert snapshot == [3, 2, 1, 5]
+        # Mutating the returned copy must not affect the instance
+        snapshot.append(99)
+        assert fake.weights == [3, 2, 1, 5]
+
+    def test_set_weights_with_sequence(self):
+        fake = Faker(self.LOCALES)
+        fake.set_weights([1, 2, 3, 4])
+        assert fake.weights == [1, 2, 3, 4]
+
+    def test_set_weights_normalizes_dashes(self):
+        fake = Faker(self.LOCALES)
+        fake.set_weights({"de-DE": 1, "en-US": 2, "en-PH": 3, "ja-JP": 4})
+        assert fake.weights == [1, 2, 3, 4]
+
+    @patch("faker.proxy.Faker._select_factory_choice")
+    @patch("faker.proxy.Faker._select_factory_distribution")
+    def test_set_weights_none_restores_uniform(self, mock_distribution, mock_choice):
+        fake = Faker(self.LOCALES)
+        fake.set_weights([1, 2, 3, 4])
+
+        fake.set_weights(None)
+        assert fake.weights is None
+        fake.name()
+        mock_choice.assert_called_once_with(fake.factories)
+        mock_distribution.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_weights,exc_type",
+        [
+            ({"de_DE": 1, "en_US": 2, "en_PH": 3}, ValueError),
+            ({"de_DE": 1, "en_US": 2, "en_PH": 3, "ja_JP": 4, "fr_FR": 1}, ValueError),
+            ([1, 2, 3], ValueError),
+            ([1, 2, 3, 4, 5], ValueError),
+            ([1, 2, 3, -1], ValueError),
+            ([1, 2, 3, float("nan")], ValueError),
+            ([1, 2, 3, float("inf")], ValueError),
+            ([1, 2, "3", 4], TypeError),
+            ([1, 2, True, 4], TypeError),
+            ([0, 0, 0, 0], ValueError),
+            ("1234", TypeError),
+        ],
+    )
+    def test_invalid_weights_rejected_wholesale(self, bad_weights, exc_type):
+        fake = Faker(self.LOCALES)
+        original = [3, 2, 1, 5]
+        fake.set_weights(OrderedDict(zip(self.LOCALES, original)))
+
+        with pytest.raises(exc_type):
+            fake.set_weights(bad_weights)
+
+        # The previous weights remain exactly as declared
+        assert fake.weights == original
+
+    def test_failed_replacement_keeps_existing_cache(self):
+        fake = Faker(self.LOCALES)
+        fake.set_weights({"de_DE": 3, "en_US": 2, "en_PH": 1, "ja_JP": 5})
+        fake.zipcode()
+        mapping = fake._method_mappings["zipcode"]
+
+        with pytest.raises(ValueError):
+            fake.set_weights([1, 2])
+
+        assert fake._method_mappings["zipcode"] is mapping
+
+    @patch("faker.proxy.Faker._select_factory_choice")
+    @patch("faker.proxy.Faker._select_factory_distribution")
+    def test_set_weights_rebuilds_distribution(self, mock_distribution, mock_choice):
+        fake = Faker(self.LOCALES)
+        fake.zipcode()
+        mock_choice.assert_called_once_with([fake["en_US"], fake["ja_JP"]])
+
+        fake.set_weights({"de_DE": 30, "en_US": 20, "en_PH": 10, "ja_JP": 50})
+        fake.zipcode()
+        mock_distribution.assert_called_once_with(
+            [fake["en_US"], fake["ja_JP"]],
+            [20, 50],
+        )
+
+    def test_zero_weights_pin_selection_to_locale(self):
+        fake = Faker(self.LOCALES)
+        fake.seed_instance(42)
+        fake.set_weights({"de_DE": 0, "en_US": 1, "en_PH": 0, "ja_JP": 0})
+
+        for _ in range(100):
+            fake.name()
+            assert fake.last_selected_locale == "en_US"
+
+    def test_last_selection_records_locale_and_exclusions(self):
+        fake = Faker(self.LOCALES)
+        assert fake.last_selection is None
+        assert fake.last_selected_locale is None
+        assert fake.last_excluded_locales == []
+
+        fake.zipcode()
+        selection = fake.last_selection
+        assert selection.method_name == "zipcode"
+        assert selection.locale in ("en_US", "ja_JP")
+        assert fake.last_selected_locale == selection.locale
+        assert selection.candidate_locales == ("en_US", "ja_JP")
+        assert selection.excluded_locales == ("de_DE", "en_PH")
+        assert fake.last_excluded_locales == ["de_DE", "en_PH"]
+
+    def test_last_selection_single_candidate_records_exclusions(self):
+        fake = Faker(self.LOCALES)
+        fake.luzon_province()
+        assert fake.last_selected_locale == "en_PH"
+        assert fake.last_excluded_locales == ["de_DE", "en_US", "ja_JP"]
+
+    def test_last_selection_unsupported_method(self):
+        fake = Faker(self.LOCALES)
+        with pytest.raises(AttributeError):
+            fake.obviously_invalid_provider_method_a23f()
+
+        selection = fake.last_selection
+        assert selection.locale is None
+        assert selection.method_name == "obviously_invalid_provider_method_a23f"
+        assert selection.candidate_locales == ()
+        assert selection.excluded_locales == tuple(self.LOCALES)
+
+    def test_on_missing_exclude_is_default(self):
+        fake = Faker(self.LOCALES)
+        assert fake.on_missing == "exclude"
+        # Missing locales are excluded instead of failing the call
+        fake.zipcode()
+        assert fake.last_excluded_locales == ["de_DE", "en_PH"]
+
+    def test_on_missing_fail_allows_methods_available_everywhere(self):
+        fake = Faker(self.LOCALES, on_missing="fail")
+        fake.seed_instance(1)
+        fake.name()
+        assert fake.last_selected_locale in self.LOCALES
+        assert fake.last_excluded_locales == []
+
+    def test_on_missing_fail_raises_and_records(self):
+        fake = Faker(self.LOCALES, on_missing="fail")
+
+        with pytest.raises(AttributeError):
+            fake.zipcode()
+        assert fake.last_selected_locale is None
+        assert fake.last_excluded_locales == ["de_DE", "en_PH"]
+
+        # The cached mapping does not resurrect the method on later calls
+        with pytest.raises(AttributeError):
+            fake.zipcode()
+
+    def test_invalid_on_missing_strategy(self):
+        with pytest.raises(ValueError):
+            Faker(self.LOCALES, on_missing="invalid")
+
+    def test_invalidate_selection_cache(self):
+        fake = Faker(self.LOCALES)
+        fake.name()
+        assert "name" in fake._method_mappings
+
+        fake.invalidate_selection_cache()
+        assert fake._method_mappings == {}
+
+    def test_invalidate_picks_up_runtime_candidate_change(self):
+        fake = Faker(["en_US", "en_PH"])
+
+        class ExtraProvider(BaseProvider):
+            def runtime_only_method(self):
+                return "runtime"
+
+        # Only the en_PH factory gains the method at runtime
+        fake["en_PH"].add_provider(ExtraProvider)
+        fake.invalidate_selection_cache()
+
+        factories, _ = fake._map_provider_method("runtime_only_method")
+        assert factories == [fake["en_PH"]]
+
+    def test_concurrent_selections_never_hit_excluded_locales(self):
+        fake = Faker(self.LOCALES)
+        fake.seed_instance(7)
+        allowed = {fake["en_US"], fake["ja_JP"]}
+        selected = []
+        errors = []
+        barrier = threading.Barrier(5)
+
+        def worker():
+            try:
+                barrier.wait()
+                for _ in range(500):
+                    selected.append(fake._select_factory("zipcode"))
+            except Exception as exc:  # pragma: no cover - surfaces thread failures
+                errors.append(exc)
+
+        def invalidator():
+            barrier.wait()
+            for index in range(200):
+                fake.invalidate_selection_cache()
+                fake.set_weights({"de_DE": index, "en_US": 1, "en_PH": 2, "ja_JP": 3})
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        threads.append(threading.Thread(target=invalidator))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        assert [thread for thread in threads if thread.is_alive()] == []
+        assert errors == []
+        assert selected
+        assert all(factory in allowed for factory in selected)
+
+    def test_weight_swap_waits_for_in_flight_rebuild(self):
+        fake = Faker(self.LOCALES)
+        entered = threading.Event()
+        can_finish = threading.Event()
+        original_build = fake._build_mapping
+
+        def blocking_build(method_name):
+            entered.set()
+            assert can_finish.wait(timeout=5)
+            return original_build(method_name)
+
+        # Force the first build to pause while holding the selection lock
+        fake._build_mapping = blocking_build
+        first = threading.Thread(target=lambda: fake.name())
+        first.start()
+        assert entered.wait(5)
+
+        swapped = threading.Event()
+        new_weights = {"de_DE": 10, "en_US": 20, "en_PH": 30, "ja_JP": 40}
+
+        def swap():
+            fake.set_weights(new_weights)
+            swapped.set()
+
+        second = threading.Thread(target=swap)
+        second.start()
+
+        # While the rebuild is paused, the swap cannot take effect
+        time.sleep(0.2)
+        assert not swapped.is_set()
+        assert fake.weights is None
+
+        can_finish.set()
+        first.join(5)
+        second.join(5)
+
+        assert swapped.is_set()
+        assert fake.weights == [10, 20, 30, 40]
+        # The in-flight snapshot was built under the old configuration and is
+        # discarded wholesale, never published as a mixed cache entry
+        assert fake._method_mappings == {}
